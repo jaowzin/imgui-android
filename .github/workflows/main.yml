@@ -1,12 +1,12 @@
-name: Build libmain.so from uploaded ZIP
+name: Build libmain.so from ZIP - Mamo Fixed
 
 on:
   workflow_dispatch:
     inputs:
       zip_name:
-        description: "Nome do ZIP no root do repo. Use AUTO para pegar o primeiro .zip"
+        description: "Nome exato do ZIP no root do repo. Ex: MamoBall_CTF_libmain_TogglePowerSprintAds_V12.zip"
         required: true
-        default: "AUTO"
+        default: "MamoBall_CTF_libmain_TogglePowerSprintAds_V12.zip"
       abi:
         description: "ABI"
         required: true
@@ -33,39 +33,40 @@ jobs:
       - name: Extract source ZIP
         shell: bash
         run: |
-          set -euo pipefail
+          set -euxo pipefail
 
           ZIP_INPUT="${{ github.event.inputs.zip_name }}"
-          if [[ "${ZIP_INPUT}" == "AUTO" ]]; then
-            ZIP_FILE="$(find "$GITHUB_WORKSPACE" -maxdepth 1 -type f -iname '*.zip' | head -n 1 || true)"
-          else
-            ZIP_FILE="$GITHUB_WORKSPACE/${ZIP_INPUT}"
-          fi
+          ZIP_FILE="$GITHUB_WORKSPACE/$ZIP_INPUT"
 
-          if [[ -z "${ZIP_FILE}" || ! -f "${ZIP_FILE}" ]]; then
-            echo "ZIP não encontrado no root do repo."
-            echo "Arquivos no root:"
-            ls -la "$GITHUB_WORKSPACE"
+          echo "Workspace: $GITHUB_WORKSPACE"
+          echo "ZIP_INPUT=$ZIP_INPUT"
+          echo "Root files:"
+          find "$GITHUB_WORKSPACE" -maxdepth 1 -type f -printf '%f\n' | sort
+
+          if [[ ! -f "$ZIP_FILE" ]]; then
+            echo "::error::ZIP não encontrado no root: $ZIP_INPUT"
             exit 1
           fi
 
-          echo "Usando ZIP: ${ZIP_FILE}"
-          rm -rf "$GITHUB_WORKSPACE/_src"
+          rm -rf "$GITHUB_WORKSPACE/_src" "$GITHUB_WORKSPACE/_build" "$GITHUB_WORKSPACE/out"
           mkdir -p "$GITHUB_WORKSPACE/_src"
-          unzip -q "${ZIP_FILE}" -d "$GITHUB_WORKSPACE/_src"
+
+          unzip -t "$ZIP_FILE"
+          unzip -q "$ZIP_FILE" -d "$GITHUB_WORKSPACE/_src"
+
+          echo "CMakeLists encontrados:"
+          find "$GITHUB_WORKSPACE/_src" -type f -name CMakeLists.txt -print
 
           PROJECT_DIR="$(find "$GITHUB_WORKSPACE/_src" -type f -path '*/app/src/main/jni/CMakeLists.txt' -printf '%h\n' | sed 's#/app/src/main/jni$##' | head -n 1 || true)"
-
-          if [[ -z "${PROJECT_DIR}" ]]; then
-            echo "Não achei app/src/main/jni/CMakeLists.txt dentro do ZIP."
-            find "$GITHUB_WORKSPACE/_src" -maxdepth 5 -type f | sort | head -n 200
+          if [[ -z "$PROJECT_DIR" ]]; then
+            echo "::error::Não achei app/src/main/jni/CMakeLists.txt dentro do ZIP."
+            find "$GITHUB_WORKSPACE/_src" -maxdepth 8 -type f | sort | head -n 300
             exit 1
           fi
 
-          echo "PROJECT_DIR=${PROJECT_DIR}" >> "$GITHUB_ENV"
-          echo "JNI_DIR=${PROJECT_DIR}/app/src/main/jni" >> "$GITHUB_ENV"
-          echo "OUT_DIR=${GITHUB_WORKSPACE}/out" >> "$GITHUB_ENV"
-          echo "Projeto detectado: ${PROJECT_DIR}"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "JNI_DIR=$PROJECT_DIR/app/src/main/jni" >> "$GITHUB_ENV"
+          echo "OUT_DIR=$GITHUB_WORKSPACE/out" >> "$GITHUB_ENV"
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -73,13 +74,13 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Setup Android SDK
+      - name: Setup Android SDK / NDK / CMake
         uses: android-actions/setup-android@v4
 
-      - name: Install NDK/CMake/Ninja
+      - name: Install build tools
         shell: bash
         run: |
-          set -euo pipefail
+          set -euxo pipefail
           sdkmanager --install \
             "platform-tools" \
             "ndk;${NDK_VERSION}" \
@@ -90,20 +91,44 @@ jobs:
           echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
           echo "${ANDROID_SDK_ROOT}/cmake/${CMAKE_VERSION}/bin" >> "$GITHUB_PATH"
 
-      - name: Verify source
+      - name: Verify and normalize source
         shell: bash
         run: |
-          set -euo pipefail
-          test -f "${JNI_DIR}/CMakeLists.txt"
-          test -f "${JNI_DIR}/Dobby/${ABI}/libdobby.a"
-          grep -R 'OUTPUT_NAME "main"' -n "${JNI_DIR}/CMakeLists.txt"
-          echo "JNI_DIR=${JNI_DIR}"
-          echo "ABI=${ABI}"
+          set -euxo pipefail
+
+          echo "JNI_DIR=$JNI_DIR"
+          echo "ABI=$ABI"
+
+          if [[ ! -f "${JNI_DIR}/CMakeLists.txt" ]]; then
+            echo "::error::CMakeLists.txt não existe em ${JNI_DIR}"
+            exit 1
+          fi
+
+          if [[ ! -f "${JNI_DIR}/Dobby/${ABI}/libdobby.a" ]]; then
+            echo "::error::Dobby não encontrado para ABI ${ABI}: ${JNI_DIR}/Dobby/${ABI}/libdobby.a"
+            echo "Dobby disponíveis:"
+            find "${JNI_DIR}/Dobby" -type f -name 'libdobby.a' -print || true
+            exit 1
+          fi
+
+          echo "Normalizando CMake para gerar libmain.so..."
+          if grep -q 'add_library(Tool SHARED' "${JNI_DIR}/CMakeLists.txt"; then
+            if ! grep -q 'OUTPUT_NAME[[:space:]]*"main"' "${JNI_DIR}/CMakeLists.txt"; then
+              printf '\nset_target_properties(Tool PROPERTIES OUTPUT_NAME "main")\n' >> "${JNI_DIR}/CMakeLists.txt"
+            fi
+          fi
+
+          echo "Trecho do CMakeLists:"
+          sed -n '1,120p' "${JNI_DIR}/CMakeLists.txt"
+
+          echo "Dobby OK:"
+          ls -lah "${JNI_DIR}/Dobby/${ABI}/libdobby.a"
 
       - name: Configure CMake
         shell: bash
         run: |
-          set -euo pipefail
+          set -euxo pipefail
+          mkdir -p "${OUT_DIR}/${ABI}"
           cmake \
             -S "${JNI_DIR}" \
             -B "${GITHUB_WORKSPACE}/_build/${ABI}" \
@@ -115,28 +140,29 @@ jobs:
             -DANDROID_STL=c++_static \
             -DCMAKE_LIBRARY_OUTPUT_DIRECTORY="${OUT_DIR}/${ABI}"
 
-      - name: Build libmain.so
+      - name: Build
         shell: bash
         run: |
-          set -euo pipefail
-          cmake --build "${GITHUB_WORKSPACE}/_build/${ABI}" --target Tool --config Release -- -v
+          set -euxo pipefail
+          cmake --build "${GITHUB_WORKSPACE}/_build/${ABI}" --config Release -- -v
 
-      - name: Collect output
+      - name: Collect artifact
         shell: bash
         run: |
-          set -euo pipefail
-          mkdir -p "${OUT_DIR}"
+          set -euxo pipefail
+          echo "Arquivos .so gerados:"
+          find "${GITHUB_WORKSPACE}/_build/${ABI}" "${OUT_DIR}/${ABI}" -type f -name '*.so' -print -exec file {} \; || true
+
           LIB_PATH="$(find "${OUT_DIR}/${ABI}" "${GITHUB_WORKSPACE}/_build/${ABI}" -type f -name 'libmain.so' | head -n 1 || true)"
-
           if [[ -z "${LIB_PATH}" ]]; then
-            echo "libmain.so não foi gerada."
-            find "${GITHUB_WORKSPACE}/_build/${ABI}" -type f | sort
+            echo "::error::libmain.so não foi gerada. Listando .so disponíveis:"
+            find "${GITHUB_WORKSPACE}/_build/${ABI}" "${OUT_DIR}/${ABI}" -type f -name '*.so' -print || true
             exit 1
           fi
 
+          mkdir -p "${OUT_DIR}"
           cp -v "${LIB_PATH}" "${OUT_DIR}/libmain.so"
           cp -v "${LIB_PATH}" "${OUT_DIR}/libmain-${ABI}.so"
-          file "${OUT_DIR}/libmain.so"
           ls -lh "${OUT_DIR}/libmain.so" "${OUT_DIR}/libmain-${ABI}.so"
 
       - name: Upload artifact
