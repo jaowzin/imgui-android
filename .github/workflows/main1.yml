@@ -1,0 +1,151 @@
+name: Build libctfagent.so from uploaded ZIP
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_name:
+        description: "ZIP da source no root do repo. Use AUTO para detectar."
+        required: true
+        default: "AUTO"
+      abi:
+        description: "Android ABI"
+        required: true
+        default: "arm64-v8a"
+        type: choice
+        options:
+          - arm64-v8a
+          - armeabi-v7a
+
+jobs:
+  build-agent:
+    runs-on: ubuntu-latest
+
+    env:
+      ANDROID_PLATFORM: android-21
+      NDK_VERSION: 23.1.7779620
+      CMAKE_VERSION: 3.22.1
+      ABI: ${{ github.event.inputs.abi || 'arm64-v8a' }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Locate and unpack source ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          INPUT_ZIP="${{ github.event.inputs.zip_name || 'AUTO' }}"
+          if [[ "${INPUT_ZIP}" == "AUTO" || -z "${INPUT_ZIP}" ]]; then
+            ZIP_FILE="$(find "${GITHUB_WORKSPACE}" -maxdepth 2 -type f -name '*.zip' | head -n 1 || true)"
+          else
+            ZIP_FILE="${GITHUB_WORKSPACE}/${INPUT_ZIP}"
+          fi
+
+          if [[ -z "${ZIP_FILE}" || ! -f "${ZIP_FILE}" ]]; then
+            echo "ZIP não encontrado. Suba o ZIP no root do repo ou informe zip_name."
+            find "${GITHUB_WORKSPACE}" -maxdepth 2 -type f | sort
+            exit 1
+          fi
+
+          echo "Found ZIP: ${ZIP_FILE}"
+          mkdir -p "${GITHUB_WORKSPACE}/_src"
+          unzip -q "${ZIP_FILE}" -d "${GITHUB_WORKSPACE}/_src"
+
+          PROJECT_DIR="$(find "${GITHUB_WORKSPACE}/_src" -type f -path '*/app/src/main/jni/CMakeLists.txt' -printf '%h\n' | sed 's#/app/src/main/jni$##' | head -n 1)"
+          if [[ -z "${PROJECT_DIR}" ]]; then
+            echo "Não achei app/src/main/jni/CMakeLists.txt dentro do ZIP."
+            find "${GITHUB_WORKSPACE}/_src" -maxdepth 5 -type f | sort | head -n 200
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=${PROJECT_DIR}" >> "${GITHUB_ENV}"
+          echo "JNI_DIR=${PROJECT_DIR}/app/src/main/jni" >> "${GITHUB_ENV}"
+          echo "OUT_DIR=${GITHUB_WORKSPACE}/out" >> "${GITHUB_ENV}"
+
+          echo "Using project: ${PROJECT_DIR}"
+          echo "Using ABI: ${ABI}"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android NDK and CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            "platform-tools" \
+            "ndk;${NDK_VERSION}" \
+            "cmake;${CMAKE_VERSION}"
+          yes | sdkmanager --licenses >/dev/null || true
+
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}" >> "${GITHUB_ENV}"
+          echo "${ANDROID_SDK_ROOT}/cmake/${CMAKE_VERSION}/bin" >> "${GITHUB_PATH}"
+
+      - name: Verify source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "${JNI_DIR}/CMakeLists.txt"
+          test -f "${JNI_DIR}/Main.cpp"
+          test -f "${JNI_DIR}/Dobby/${ABI}/libdobby.a"
+          grep -R "Agent_OnAttach" -n "${JNI_DIR}/Main.cpp"
+          grep -R "add_library(ctfagent SHARED" -n "${JNI_DIR}/CMakeLists.txt"
+          echo "OK: source pronta para ADB attach-agent"
+
+      - name: Configure native build
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake \
+            -S "${JNI_DIR}" \
+            -B "${GITHUB_WORKSPACE}/_native_build/${ABI}" \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI="${ABI}" \
+            -DANDROID_PLATFORM="${ANDROID_PLATFORM}" \
+            -DANDROID_STL=c++_static \
+            -DCMAKE_LIBRARY_OUTPUT_DIRECTORY="${OUT_DIR}/${ABI}"
+
+      - name: Build libctfagent.so
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --build "${GITHUB_WORKSPACE}/_native_build/${ABI}" --target ctfagent --config Release -- -v
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${OUT_DIR}"
+          LIB_PATH="$(find "${OUT_DIR}/${ABI}" "${GITHUB_WORKSPACE}/_native_build/${ABI}" -type f -name 'libctfagent.so' | head -n 1 || true)"
+
+          if [[ -z "${LIB_PATH}" ]]; then
+            echo "libctfagent.so não encontrada"
+            find "${GITHUB_WORKSPACE}/_native_build/${ABI}" -type f | sort
+            exit 1
+          fi
+
+          cp -v "${LIB_PATH}" "${OUT_DIR}/libctfagent-${ABI}.so"
+          cp -v "${LIB_PATH}" "${OUT_DIR}/libctfagent.so"
+          file "${OUT_DIR}/libctfagent-${ABI}.so"
+          ls -lh "${OUT_DIR}"
+
+      - name: Upload libctfagent.so
+        uses: actions/upload-artifact@v4
+        with:
+          name: libctfagent-${{ env.ABI }}
+          path: |
+            out/libctfagent-${{ env.ABI }}.so
+            out/libctfagent.so
+          if-no-files-found: error
