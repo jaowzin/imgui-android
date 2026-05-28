@@ -1,0 +1,149 @@
+name: Build libmain.so from uploaded ZIP
+
+on:
+  workflow_dispatch:
+    inputs:
+      zip_name:
+        description: "Nome do ZIP no root do repo. Use AUTO para pegar o primeiro .zip"
+        required: true
+        default: "AUTO"
+      abi:
+        description: "ABI"
+        required: true
+        default: "arm64-v8a"
+        type: choice
+        options:
+          - arm64-v8a
+          - armeabi-v7a
+
+jobs:
+  build-libmain:
+    runs-on: ubuntu-latest
+
+    env:
+      ANDROID_PLATFORM: android-19
+      NDK_VERSION: 23.1.7779620
+      CMAKE_VERSION: 3.22.1
+      ABI: ${{ github.event.inputs.abi }}
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Extract source ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP_INPUT="${{ github.event.inputs.zip_name }}"
+          if [[ "${ZIP_INPUT}" == "AUTO" ]]; then
+            ZIP_FILE="$(find "$GITHUB_WORKSPACE" -maxdepth 1 -type f -iname '*.zip' | head -n 1 || true)"
+          else
+            ZIP_FILE="$GITHUB_WORKSPACE/${ZIP_INPUT}"
+          fi
+
+          if [[ -z "${ZIP_FILE}" || ! -f "${ZIP_FILE}" ]]; then
+            echo "ZIP não encontrado no root do repo."
+            echo "Arquivos no root:"
+            ls -la "$GITHUB_WORKSPACE"
+            exit 1
+          fi
+
+          echo "Usando ZIP: ${ZIP_FILE}"
+          rm -rf "$GITHUB_WORKSPACE/_src"
+          mkdir -p "$GITHUB_WORKSPACE/_src"
+          unzip -q "${ZIP_FILE}" -d "$GITHUB_WORKSPACE/_src"
+
+          PROJECT_DIR="$(find "$GITHUB_WORKSPACE/_src" -type f -path '*/app/src/main/jni/CMakeLists.txt' -printf '%h\n' | sed 's#/app/src/main/jni$##' | head -n 1 || true)"
+
+          if [[ -z "${PROJECT_DIR}" ]]; then
+            echo "Não achei app/src/main/jni/CMakeLists.txt dentro do ZIP."
+            find "$GITHUB_WORKSPACE/_src" -maxdepth 5 -type f | sort | head -n 200
+            exit 1
+          fi
+
+          echo "PROJECT_DIR=${PROJECT_DIR}" >> "$GITHUB_ENV"
+          echo "JNI_DIR=${PROJECT_DIR}/app/src/main/jni" >> "$GITHUB_ENV"
+          echo "OUT_DIR=${GITHUB_WORKSPACE}/out" >> "$GITHUB_ENV"
+          echo "Projeto detectado: ${PROJECT_DIR}"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install NDK/CMake/Ninja
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install \
+            "platform-tools" \
+            "ndk;${NDK_VERSION}" \
+            "cmake;${CMAKE_VERSION}"
+          yes | sdkmanager --licenses >/dev/null || true
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
+          echo "${ANDROID_SDK_ROOT}/cmake/${CMAKE_VERSION}/bin" >> "$GITHUB_PATH"
+
+      - name: Verify source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f "${JNI_DIR}/CMakeLists.txt"
+          test -f "${JNI_DIR}/Dobby/${ABI}/libdobby.a"
+          grep -R 'OUTPUT_NAME "main"' -n "${JNI_DIR}/CMakeLists.txt"
+          echo "JNI_DIR=${JNI_DIR}"
+          echo "ABI=${ABI}"
+
+      - name: Configure CMake
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake \
+            -S "${JNI_DIR}" \
+            -B "${GITHUB_WORKSPACE}/_build/${ABI}" \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI="${ABI}" \
+            -DANDROID_PLATFORM="${ANDROID_PLATFORM}" \
+            -DANDROID_STL=c++_static \
+            -DCMAKE_LIBRARY_OUTPUT_DIRECTORY="${OUT_DIR}/${ABI}"
+
+      - name: Build libmain.so
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmake --build "${GITHUB_WORKSPACE}/_build/${ABI}" --target Tool --config Release -- -v
+
+      - name: Collect output
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "${OUT_DIR}"
+          LIB_PATH="$(find "${OUT_DIR}/${ABI}" "${GITHUB_WORKSPACE}/_build/${ABI}" -type f -name 'libmain.so' | head -n 1 || true)"
+
+          if [[ -z "${LIB_PATH}" ]]; then
+            echo "libmain.so não foi gerada."
+            find "${GITHUB_WORKSPACE}/_build/${ABI}" -type f | sort
+            exit 1
+          fi
+
+          cp -v "${LIB_PATH}" "${OUT_DIR}/libmain.so"
+          cp -v "${LIB_PATH}" "${OUT_DIR}/libmain-${ABI}.so"
+          file "${OUT_DIR}/libmain.so"
+          ls -lh "${OUT_DIR}/libmain.so" "${OUT_DIR}/libmain-${ABI}.so"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: libmain-${{ env.ABI }}
+          path: |
+            out/libmain.so
+            out/libmain-${{ env.ABI }}.so
+          if-no-files-found: error
