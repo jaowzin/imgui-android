@@ -1,10 +1,10 @@
-name: Build libmain.so from ZIP - Mamo Fixed
+name: Build libmain.so from ZIP - Mamo AUTO Versioned
 
 on:
   workflow_dispatch:
     inputs:
       zip_name:
-        description: "Nome do ZIP no root do repo. Use AUTO para pegar automaticamente o maior/mais novo MamoBall_CTF*.zip"
+        description: "Nome do ZIP no root do repo. Use AUTO para pegar a maior versão V*.zip com Dobby."
         required: true
         default: "AUTO"
       abi:
@@ -30,36 +30,67 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      - name: Extract source ZIP
+      - name: Select and extract source ZIP
         shell: bash
         run: |
           set -euxo pipefail
 
           ZIP_INPUT="${{ github.event.inputs.zip_name }}"
-
           echo "Workspace: $GITHUB_WORKSPACE"
           echo "ZIP_INPUT=$ZIP_INPUT"
+          echo "ABI=$ABI"
           echo "Root files:"
           find "$GITHUB_WORKSPACE" -maxdepth 1 -type f -printf '%f\n' | sort
 
           if [[ "$ZIP_INPUT" == "AUTO" ]]; then
-            echo "Modo AUTO ligado."
-            echo "Procurando primeiro por MamoBall_CTF*.zip no root..."
-            mapfile -t CANDIDATES < <(find "$GITHUB_WORKSPACE" -maxdepth 1 -type f -name 'MamoBall_CTF*.zip' -printf '%f\n' | sort -V)
-            if [[ "${#CANDIDATES[@]}" -eq 0 ]]; then
-              echo "Nenhum MamoBall_CTF*.zip encontrado. Procurando qualquer .zip no root..."
-              mapfile -t CANDIDATES < <(find "$GITHUB_WORKSPACE" -maxdepth 1 -type f -name '*.zip' -printf '%f\n' | sort -V)
-            fi
-            if [[ "${#CANDIDATES[@]}" -eq 0 ]]; then
-              echo "::error::Nenhum arquivo .zip encontrado no root do repo."
-              exit 1
-            fi
-            ZIP_INPUT="${CANDIDATES[-1]}"
+            python3 - <<'PY' > "$GITHUB_WORKSPACE/_selected_zip.txt"
+import os, re, zipfile, sys
+root = os.environ["GITHUB_WORKSPACE"]
+abi = os.environ["ABI"]
+
+zips = [
+    f for f in os.listdir(root)
+    if f.lower().endswith(".zip") and os.path.isfile(os.path.join(root, f))
+]
+mamo = [f for f in zips if f.startswith("MamoBall_CTF")]
+candidates = mamo or zips
+
+def version_of(name):
+    nums = re.findall(r'(?:^|[_-])V(\d+)(?:\D|$)', name, flags=re.I)
+    return int(nums[-1]) if nums else -1
+
+rows = []
+for name in candidates:
+    path = os.path.join(root, name)
+    ok_cmake = False
+    ok_dobby = False
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = set(z.namelist())
+            ok_cmake = any(n.endswith("app/src/main/jni/CMakeLists.txt") for n in names)
+            ok_dobby = any(n.endswith(f"app/src/main/jni/Dobby/{abi}/libdobby.a") for n in names)
+    except Exception:
+        pass
+    rows.append((ok_cmake, ok_dobby, version_of(name), os.path.getmtime(path), name))
+
+print("Candidatos ZIP:", file=sys.stderr)
+for ok_cmake, ok_dobby, ver, mtime, name in sorted(rows, key=lambda x: (x[2], x[3], x[1], x[0]), reverse=True):
+    print(f"  V={ver} cmake={ok_cmake} dobby_{abi}={ok_dobby} {name}", file=sys.stderr)
+
+valid = [r for r in rows if r[0] and r[1]]
+if not valid:
+    print("::error::AUTO não achou ZIP com CMakeLists.txt e Dobby para ABI " + abi, file=sys.stderr)
+    print("Dica: suba o ZIP V12_FULL/V13 ou informe zip_name manualmente.", file=sys.stderr)
+    sys.exit(1)
+
+chosen = sorted(valid, key=lambda x: (x[2], x[3]), reverse=True)[0][4]
+print(chosen)
+PY
+            ZIP_INPUT="$(cat "$GITHUB_WORKSPACE/_selected_zip.txt")"
             echo "AUTO selecionou: $ZIP_INPUT"
           fi
 
           ZIP_FILE="$GITHUB_WORKSPACE/$ZIP_INPUT"
-
           if [[ ! -f "$ZIP_FILE" ]]; then
             echo "::error::ZIP não encontrado no root: $ZIP_INPUT"
             exit 1
@@ -84,6 +115,7 @@ jobs:
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
           echo "JNI_DIR=$PROJECT_DIR/app/src/main/jni" >> "$GITHUB_ENV"
           echo "OUT_DIR=$GITHUB_WORKSPACE/out" >> "$GITHUB_ENV"
+          echo "ZIP_SELECTED=$ZIP_INPUT" >> "$GITHUB_ENV"
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -98,10 +130,7 @@ jobs:
         shell: bash
         run: |
           set -euxo pipefail
-          sdkmanager --install \
-            "platform-tools" \
-            "ndk;${NDK_VERSION}" \
-            "cmake;${CMAKE_VERSION}"
+          sdkmanager --install             "platform-tools"             "ndk;${NDK_VERSION}"             "cmake;${CMAKE_VERSION}"
           yes | sdkmanager --licenses >/dev/null || true
           sudo apt-get update
           sudo apt-get install -y ninja-build
@@ -113,6 +142,7 @@ jobs:
         run: |
           set -euxo pipefail
 
+          echo "ZIP_SELECTED=$ZIP_SELECTED"
           echo "JNI_DIR=$JNI_DIR"
           echo "ABI=$ABI"
 
@@ -136,7 +166,7 @@ jobs:
           fi
 
           echo "Trecho do CMakeLists:"
-          sed -n '1,120p' "${JNI_DIR}/CMakeLists.txt"
+          sed -n '1,160p' "${JNI_DIR}/CMakeLists.txt"
 
           echo "Dobby OK:"
           ls -lah "${JNI_DIR}/Dobby/${ABI}/libdobby.a"
@@ -146,16 +176,7 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p "${OUT_DIR}/${ABI}"
-          cmake \
-            -S "${JNI_DIR}" \
-            -B "${GITHUB_WORKSPACE}/_build/${ABI}" \
-            -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake" \
-            -DANDROID_ABI="${ABI}" \
-            -DANDROID_PLATFORM="${ANDROID_PLATFORM}" \
-            -DANDROID_STL=c++_static \
-            -DCMAKE_LIBRARY_OUTPUT_DIRECTORY="${OUT_DIR}/${ABI}"
+          cmake             -S "${JNI_DIR}"             -B "${GITHUB_WORKSPACE}/_build/${ABI}"             -G Ninja             -DCMAKE_BUILD_TYPE=Release             -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake"             -DANDROID_ABI="${ABI}"             -DANDROID_PLATFORM="${ANDROID_PLATFORM}"             -DANDROID_STL=c++_static             -DCMAKE_LIBRARY_OUTPUT_DIRECTORY="${OUT_DIR}/${ABI}"
 
       - name: Build
         shell: bash
