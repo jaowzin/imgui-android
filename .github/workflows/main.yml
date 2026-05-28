@@ -1,14 +1,14 @@
-name: Build libmain.so from ZIP - Mamo AUTO Versioned
+name: Build Mamo libmain.so from ZIP
 
 on:
   workflow_dispatch:
     inputs:
       zip_name:
-        description: "Nome do ZIP no root do repo. Use AUTO para pegar a maior versão V*.zip com Dobby."
+        description: "Nome do ZIP no root. Use AUTO para escolher o MamoBall_CTF V mais recente valido."
         required: true
         default: "AUTO"
       abi:
-        description: "ABI"
+        description: "ABI para build"
         required: true
         default: "arm64-v8a"
         type: choice
@@ -17,105 +17,126 @@ on:
           - armeabi-v7a
 
 jobs:
-  build-libmain:
+  build:
     runs-on: ubuntu-latest
 
     env:
+      ABI: ${{ github.event.inputs.abi }}
       ANDROID_PLATFORM: android-19
       NDK_VERSION: 23.1.7779620
       CMAKE_VERSION: 3.22.1
-      ABI: ${{ github.event.inputs.abi }}
 
     steps:
-      - name: Checkout repo
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Select and extract source ZIP
+      - name: Select ZIP
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
 
           ZIP_INPUT="${{ github.event.inputs.zip_name }}"
-          echo "Workspace: $GITHUB_WORKSPACE"
-          echo "ZIP_INPUT=$ZIP_INPUT"
-          echo "ABI=$ABI"
-          echo "Root files:"
-          find "$GITHUB_WORKSPACE" -maxdepth 1 -type f -printf '%f\n' | sort
+          echo "ZIP input: ${ZIP_INPUT}"
+          echo "ABI: ${ABI}"
 
-          if [[ "$ZIP_INPUT" == "AUTO" ]]; then
-            python3 - <<'PY' > "$GITHUB_WORKSPACE/_selected_zip.txt"
-import os, re, zipfile, sys
-root = os.environ["GITHUB_WORKSPACE"]
-abi = os.environ["ABI"]
+          if [ "${ZIP_INPUT}" = "AUTO" ]; then
+          python3 - <<'PY' > selected_zip.txt
+          import os
+          import re
+          import sys
+          import zipfile
 
-zips = [
-    f for f in os.listdir(root)
-    if f.lower().endswith(".zip") and os.path.isfile(os.path.join(root, f))
-]
-mamo = [f for f in zips if f.startswith("MamoBall_CTF")]
-candidates = mamo or zips
+          root = os.environ["GITHUB_WORKSPACE"]
+          abi = os.environ["ABI"]
 
-def version_of(name):
-    nums = re.findall(r'(?:^|[_-])V(\d+)(?:\D|$)', name, flags=re.I)
-    return int(nums[-1]) if nums else -1
+          def version(name: str) -> int:
+              m = re.findall(r"V(\d+)", name, flags=re.IGNORECASE)
+              return int(m[-1]) if m else -1
 
-rows = []
-for name in candidates:
-    path = os.path.join(root, name)
-    ok_cmake = False
-    ok_dobby = False
-    try:
-        with zipfile.ZipFile(path) as z:
-            names = set(z.namelist())
-            ok_cmake = any(n.endswith("app/src/main/jni/CMakeLists.txt") for n in names)
-            ok_dobby = any(n.endswith(f"app/src/main/jni/Dobby/{abi}/libdobby.a") for n in names)
-    except Exception:
-        pass
-    rows.append((ok_cmake, ok_dobby, version_of(name), os.path.getmtime(path), name))
+          rows = []
+          for name in os.listdir(root):
+              if not name.lower().endswith(".zip"):
+                  continue
+              path = os.path.join(root, name)
+              if not os.path.isfile(path):
+                  continue
 
-print("Candidatos ZIP:", file=sys.stderr)
-for ok_cmake, ok_dobby, ver, mtime, name in sorted(rows, key=lambda x: (x[2], x[3], x[1], x[0]), reverse=True):
-    print(f"  V={ver} cmake={ok_cmake} dobby_{abi}={ok_dobby} {name}", file=sys.stderr)
+              has_cmake = False
+              has_dobby = False
+              try:
+                  with zipfile.ZipFile(path) as z:
+                      files = z.namelist()
+                      has_cmake = any(f.endswith("app/src/main/jni/CMakeLists.txt") for f in files)
+                      has_dobby = any(f.endswith(f"app/src/main/jni/Dobby/{abi}/libdobby.a") for f in files)
+              except Exception as e:
+                  print(f"ZIP invalido: {name}: {e}", file=sys.stderr)
 
-valid = [r for r in rows if r[0] and r[1]]
-if not valid:
-    print("::error::AUTO não achou ZIP com CMakeLists.txt e Dobby para ABI " + abi, file=sys.stderr)
-    print("Dica: suba o ZIP V12_FULL/V13 ou informe zip_name manualmente.", file=sys.stderr)
-    sys.exit(1)
+              rows.append({
+                  "name": name,
+                  "version": version(name),
+                  "mtime": os.path.getmtime(path),
+                  "has_cmake": has_cmake,
+                  "has_dobby": has_dobby,
+                  "is_mamo": name.startswith("MamoBall_CTF"),
+              })
 
-chosen = sorted(valid, key=lambda x: (x[2], x[3]), reverse=True)[0][4]
-print(chosen)
-PY
-            ZIP_INPUT="$(cat "$GITHUB_WORKSPACE/_selected_zip.txt")"
-            echo "AUTO selecionou: $ZIP_INPUT"
+          print("ZIPs encontrados:", file=sys.stderr)
+          for r in sorted(rows, key=lambda x: (x["is_mamo"], x["version"], x["mtime"]), reverse=True):
+              print(
+                  f'  {r["name"]} | V={r["version"]} | cmake={r["has_cmake"]} | dobby_{abi}={r["has_dobby"]}',
+                  file=sys.stderr,
+              )
+
+          valid = [r for r in rows if r["is_mamo"] and r["has_cmake"] and r["has_dobby"]]
+          if not valid:
+              valid = [r for r in rows if r["has_cmake"] and r["has_dobby"]]
+
+          if not valid:
+              print("ERRO: nenhum ZIP valido com CMakeLists.txt e Dobby para a ABI " + abi, file=sys.stderr)
+              sys.exit(1)
+
+          chosen = sorted(valid, key=lambda x: (x["version"], x["mtime"]), reverse=True)[0]["name"]
+          print(chosen)
+          PY
+          ZIP_INPUT="$(cat selected_zip.txt)"
           fi
 
-          ZIP_FILE="$GITHUB_WORKSPACE/$ZIP_INPUT"
-          if [[ ! -f "$ZIP_FILE" ]]; then
-            echo "::error::ZIP não encontrado no root: $ZIP_INPUT"
+          ZIP_FILE="${GITHUB_WORKSPACE}/${ZIP_INPUT}"
+          if [ ! -f "${ZIP_FILE}" ]; then
+            echo "::error::ZIP nao encontrado: ${ZIP_FILE}"
             exit 1
           fi
 
-          rm -rf "$GITHUB_WORKSPACE/_src" "$GITHUB_WORKSPACE/_build" "$GITHUB_WORKSPACE/out"
-          mkdir -p "$GITHUB_WORKSPACE/_src"
+          echo "ZIP selecionado: ${ZIP_INPUT}"
+          echo "ZIP_FILE=${ZIP_FILE}" >> "${GITHUB_ENV}"
 
-          unzip -t "$ZIP_FILE"
-          unzip -q "$ZIP_FILE" -d "$GITHUB_WORKSPACE/_src"
+      - name: Extract ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          echo "CMakeLists encontrados:"
-          find "$GITHUB_WORKSPACE/_src" -type f -name CMakeLists.txt -print
+          rm -rf "${GITHUB_WORKSPACE}/_src" "${GITHUB_WORKSPACE}/_build" "${GITHUB_WORKSPACE}/out"
+          mkdir -p "${GITHUB_WORKSPACE}/_src" "${GITHUB_WORKSPACE}/out"
 
-          PROJECT_DIR="$(find "$GITHUB_WORKSPACE/_src" -type f -path '*/app/src/main/jni/CMakeLists.txt' -printf '%h\n' | sed 's#/app/src/main/jni$##' | head -n 1 || true)"
-          if [[ -z "$PROJECT_DIR" ]]; then
-            echo "::error::Não achei app/src/main/jni/CMakeLists.txt dentro do ZIP."
-            find "$GITHUB_WORKSPACE/_src" -maxdepth 8 -type f | sort | head -n 300
+          unzip -t "${ZIP_FILE}"
+          unzip -q "${ZIP_FILE}" -d "${GITHUB_WORKSPACE}/_src"
+
+          JNI_DIR="$(find "${GITHUB_WORKSPACE}/_src" -type f -path "*/app/src/main/jni/CMakeLists.txt" -printf "%h\n" | head -n 1)"
+          if [ -z "${JNI_DIR}" ]; then
+            echo "::error::Nao achei app/src/main/jni/CMakeLists.txt dentro do ZIP."
+            find "${GITHUB_WORKSPACE}/_src" -maxdepth 6 -type f | sort | head -n 200
             exit 1
           fi
 
-          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "JNI_DIR=$PROJECT_DIR/app/src/main/jni" >> "$GITHUB_ENV"
-          echo "OUT_DIR=$GITHUB_WORKSPACE/out" >> "$GITHUB_ENV"
-          echo "ZIP_SELECTED=$ZIP_INPUT" >> "$GITHUB_ENV"
+          echo "JNI_DIR=${JNI_DIR}" >> "${GITHUB_ENV}"
+          echo "JNI_DIR: ${JNI_DIR}"
+
+          if [ ! -f "${JNI_DIR}/Dobby/${ABI}/libdobby.a" ]; then
+            echo "::error::Nao achei Dobby/${ABI}/libdobby.a dentro do ZIP selecionado."
+            echo "Dobby encontrados:"
+            find "${JNI_DIR}/Dobby" -type f -name "libdobby.a" -print || true
+            exit 1
+          fi
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -123,85 +144,62 @@ PY
           distribution: temurin
           java-version: "17"
 
-      - name: Setup Android SDK / NDK / CMake
+      - name: Setup Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Install build tools
+      - name: Install NDK and CMake
         shell: bash
         run: |
-          set -euxo pipefail
-          sdkmanager --install             "platform-tools"             "ndk;${NDK_VERSION}"             "cmake;${CMAKE_VERSION}"
+          set -euo pipefail
+          sdkmanager --install \
+            "platform-tools" \
+            "ndk;${NDK_VERSION}" \
+            "cmake;${CMAKE_VERSION}"
           yes | sdkmanager --licenses >/dev/null || true
           sudo apt-get update
           sudo apt-get install -y ninja-build
-          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}" >> "$GITHUB_ENV"
-          echo "${ANDROID_SDK_ROOT}/cmake/${CMAKE_VERSION}/bin" >> "$GITHUB_PATH"
-
-      - name: Verify and normalize source
-        shell: bash
-        run: |
-          set -euxo pipefail
-
-          echo "ZIP_SELECTED=$ZIP_SELECTED"
-          echo "JNI_DIR=$JNI_DIR"
-          echo "ABI=$ABI"
-
-          if [[ ! -f "${JNI_DIR}/CMakeLists.txt" ]]; then
-            echo "::error::CMakeLists.txt não existe em ${JNI_DIR}"
-            exit 1
-          fi
-
-          if [[ ! -f "${JNI_DIR}/Dobby/${ABI}/libdobby.a" ]]; then
-            echo "::error::Dobby não encontrado para ABI ${ABI}: ${JNI_DIR}/Dobby/${ABI}/libdobby.a"
-            echo "Dobby disponíveis:"
-            find "${JNI_DIR}/Dobby" -type f -name 'libdobby.a' -print || true
-            exit 1
-          fi
-
-          echo "Normalizando CMake para gerar libmain.so..."
-          if grep -q 'add_library(Tool SHARED' "${JNI_DIR}/CMakeLists.txt"; then
-            if ! grep -q 'OUTPUT_NAME[[:space:]]*"main"' "${JNI_DIR}/CMakeLists.txt"; then
-              printf '\nset_target_properties(Tool PROPERTIES OUTPUT_NAME "main")\n' >> "${JNI_DIR}/CMakeLists.txt"
-            fi
-          fi
-
-          echo "Trecho do CMakeLists:"
-          sed -n '1,160p' "${JNI_DIR}/CMakeLists.txt"
-
-          echo "Dobby OK:"
-          ls -lah "${JNI_DIR}/Dobby/${ABI}/libdobby.a"
+          echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/${NDK_VERSION}" >> "${GITHUB_ENV}"
+          echo "${ANDROID_SDK_ROOT}/cmake/${CMAKE_VERSION}/bin" >> "${GITHUB_PATH}"
 
       - name: Configure CMake
         shell: bash
         run: |
-          set -euxo pipefail
-          mkdir -p "${OUT_DIR}/${ABI}"
-          cmake             -S "${JNI_DIR}"             -B "${GITHUB_WORKSPACE}/_build/${ABI}"             -G Ninja             -DCMAKE_BUILD_TYPE=Release             -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake"             -DANDROID_ABI="${ABI}"             -DANDROID_PLATFORM="${ANDROID_PLATFORM}"             -DANDROID_STL=c++_static             -DCMAKE_LIBRARY_OUTPUT_DIRECTORY="${OUT_DIR}/${ABI}"
+          set -euo pipefail
+          cmake \
+            -S "${JNI_DIR}" \
+            -B "${GITHUB_WORKSPACE}/_build/${ABI}" \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI="${ABI}" \
+            -DANDROID_PLATFORM="${ANDROID_PLATFORM}" \
+            -DANDROID_STL=c++_static \
+            -DCMAKE_LIBRARY_OUTPUT_DIRECTORY="${GITHUB_WORKSPACE}/out/${ABI}"
 
       - name: Build
         shell: bash
         run: |
-          set -euxo pipefail
+          set -euo pipefail
           cmake --build "${GITHUB_WORKSPACE}/_build/${ABI}" --config Release -- -v
 
-      - name: Collect artifact
+      - name: Collect libmain.so
         shell: bash
         run: |
-          set -euxo pipefail
-          echo "Arquivos .so gerados:"
-          find "${GITHUB_WORKSPACE}/_build/${ABI}" "${OUT_DIR}/${ABI}" -type f -name '*.so' -print -exec file {} \; || true
+          set -euo pipefail
 
-          LIB_PATH="$(find "${OUT_DIR}/${ABI}" "${GITHUB_WORKSPACE}/_build/${ABI}" -type f -name 'libmain.so' | head -n 1 || true)"
-          if [[ -z "${LIB_PATH}" ]]; then
-            echo "::error::libmain.so não foi gerada. Listando .so disponíveis:"
-            find "${GITHUB_WORKSPACE}/_build/${ABI}" "${OUT_DIR}/${ABI}" -type f -name '*.so' -print || true
+          echo "SO geradas:"
+          find "${GITHUB_WORKSPACE}/_build/${ABI}" "${GITHUB_WORKSPACE}/out/${ABI}" -type f -name "*.so" -print || true
+
+          LIB_PATH="$(find "${GITHUB_WORKSPACE}/out/${ABI}" "${GITHUB_WORKSPACE}/_build/${ABI}" -type f -name "libmain.so" | head -n 1 || true)"
+
+          if [ -z "${LIB_PATH}" ]; then
+            echo "::error::libmain.so nao foi gerada."
             exit 1
           fi
 
-          mkdir -p "${OUT_DIR}"
-          cp -v "${LIB_PATH}" "${OUT_DIR}/libmain.so"
-          cp -v "${LIB_PATH}" "${OUT_DIR}/libmain-${ABI}.so"
-          ls -lh "${OUT_DIR}/libmain.so" "${OUT_DIR}/libmain-${ABI}.so"
+          cp -v "${LIB_PATH}" "${GITHUB_WORKSPACE}/out/libmain.so"
+          cp -v "${LIB_PATH}" "${GITHUB_WORKSPACE}/out/libmain-${ABI}.so"
+          ls -lh "${GITHUB_WORKSPACE}/out/libmain.so" "${GITHUB_WORKSPACE}/out/libmain-${ABI}.so"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
